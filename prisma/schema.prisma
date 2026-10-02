@@ -1,0 +1,174 @@
+// Donora — טראקר תרומות לשיעור דף יומי
+// ראו .claude/plans או התכנית המאושרת לרקע מלא על ההחלטות.
+
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "cjs"
+}
+
+// Prisma 7: אין url/directUrl בקובץ הסכמה — שניהם עוברים ל-prisma.config.ts
+datasource db {
+  provider = "postgresql"
+}
+
+/// המשתמש היחיד שמתחבר למערכת. אין טבלת Admin — הזיהוי מגיע מ-Supabase Auth,
+/// וה-id שלו (uuid) מושווה ישירות ל-GABBAI_USER_ID בסביבה.
+model Member {
+  id                   String   @id @default(uuid())
+  fullName             String
+  phone                String   @unique // E.164: +9725XXXXXXXX
+  email                String?
+  defaultMonthlyPledge Decimal  @default(0) @db.Decimal(10, 2)
+  isActive             Boolean  @default(true)
+  notes                String?
+  /// טוקן ללינק האישי לקריאה בלבד (/m/[token]). מוחלף אם נחשד שדלף.
+  portalToken          String   @unique @default(uuid())
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  contributions Contribution[]
+  reminders     ReminderNotification[]
+
+  @@index([isActive])
+}
+
+/// מחזור חודשי לפי הלוח העברי. נפתח אוטומטית שבוע לפני ראש חודש (startsAt),
+/// וממשיך עד שבוע לפני ראש החודש הבא (endsAt). שני מחזורים יכולים להיות
+/// OPEN במקביל בחפיפה של שבוע.
+model MonthlyCycle {
+  id                     String      @id @default(uuid())
+  /// לפי enum החודשים של hebcal (1=Nisan..13=Adar2 בשנה מעוברת)
+  hebrewMonth            Int
+  /// שנה עברית מלאה, למשל 5787. Int לצורך מיון/השוואה — לא גימטריה.
+  hebrewYear             Int
+  /// תחילת החלון המקדים: ראש חודש פחות 7 ימים (גרגוריאני, מחושב מראש)
+  startsAt               DateTime
+  roshChodeshAt          DateTime
+  /// תחילת החלון המקדים של החודש הבא = סוף המחזור הזה
+  endsAt                 DateTime
+  targetGoal             Decimal?    @db.Decimal(10, 2)
+  reminderDayOfMonth     Int         @default(1)
+  lateReminderDayOfMonth Int         @default(15)
+  status                 CycleStatus @default(OPEN)
+  createdAt              DateTime    @default(now())
+
+  contributions Contribution[]
+  reminders     ReminderNotification[]
+
+  @@unique([hebrewYear, hebrewMonth])
+  @@index([status, startsAt])
+}
+
+model Contribution {
+  id             String             @id @default(uuid())
+  memberId       String? // null = תרומה אנונימית
+  cycleId        String? // null = תרומה חד-פעמית עצמאית, לא קשורה למחזור
+  type           ContributionType
+  reason         ContributionReason @default(GENERAL_SUPPORT)
+  /// נדרש כש-reason=OTHER
+  reasonOther    String?
+  dedicationNote String?
+  pledgedAmount  Decimal            @db.Decimal(10, 2)
+  /// null לפני תשלום בפועל — 0 היה שקר (לא ברור אם שולם 0 או שלא שולם)
+  actualAmount   Decimal?           @db.Decimal(10, 2)
+  paymentMethod  PaymentMethod?
+  status         ContributionStatus @default(PENDING)
+  paidAt         DateTime?
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+
+  member Member?       @relation(fields: [memberId], references: [id])
+  cycle  MonthlyCycle? @relation(fields: [cycleId], references: [id])
+
+  // אין כפל שורה חודשית לאותו חבר באותו מחזור ומאותו סוג
+  @@unique([memberId, cycleId, type])
+  @@index([cycleId, status])
+  @@index([memberId])
+}
+
+model ReminderNotification {
+  id             String         @id @default(uuid())
+  memberId       String
+  cycleId        String
+  type           ReminderType
+  channel        Channel
+  deliveryStatus DeliveryStatus @default(PENDING)
+  sentAt         DateTime?
+  error          String?
+  attempts       Int            @default(0)
+  createdAt      DateTime       @default(now())
+
+  member Member       @relation(fields: [memberId], references: [id])
+  cycle  MonthlyCycle @relation(fields: [cycleId], references: [id])
+
+  // אנטי-כפילות: לא שולחים את אותה תזכורת פעמיים לאותו חבר באותו מחזור
+  @@unique([memberId, cycleId, type])
+  @@index([deliveryStatus])
+}
+
+/// יומן ריצות הקרון היומי — לבדיקת בריאות ("הגיבוי לא רץ 36 שעות" וכו')
+model CronRunLog {
+  id          String    @id @default(uuid())
+  startedAt   DateTime  @default(now())
+  finishedAt  DateTime?
+  /// שם השלב: OPEN_CYCLE | MARK_OVERDUE | REMIND_INITIAL | REMIND_LATE | FLUSH_OUTBOX | BACKUP | HEALTH_CHECK
+  step        String
+  ok          Boolean   @default(false)
+  detail      String?
+
+  @@index([step, startedAt])
+}
+
+enum CycleStatus {
+  OPEN
+  CLOSED
+}
+
+enum ContributionType {
+  MONTHLY_RECURRING
+  ONE_TIME
+}
+
+enum ContributionStatus {
+  PENDING
+  PAID
+  EXEMPT
+  OVERDUE
+}
+
+enum PaymentMethod {
+  BIT
+  PAYBOX
+  BANK_TRANSFER
+  CASH
+  CREDIT_CARD
+  OTHER
+}
+
+enum ContributionReason {
+  YAHRZEIT
+  REFUAH_SHLEIMA
+  SIMCHA
+  HODAAH
+  GENERAL_SUPPORT
+  OTHER
+}
+
+enum ReminderType {
+  INITIAL_MONTHLY
+  LATE_FOLLOWUP
+  MANUAL_NUDGE
+}
+
+enum Channel {
+  EMAIL
+  WHATSAPP_LINK
+}
+
+enum DeliveryStatus {
+  PENDING
+  SENT
+  FAILED
+  SKIPPED
+}
